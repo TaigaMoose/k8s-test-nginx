@@ -1,0 +1,141 @@
+# Деплоймент рабочий, проверялся на RKE/Hetzner, может потребовать только адаптации лейблов в "affinity".
+# Deployment + HPA + Service.
+# На мой взгляд все-таки требования получить одновременно максимально отказоустойчивый deployment и
+# минимальное потребление ресурсов противоречат друг-другу, поэтому возьмем HPA с 3 репликами минимум, но если
+# минимально потребление важнее, скорректируем minReplicas на 1 (но я лично оставил бы 3,
+# тк в таком случае всплеск нагрузки при падении одной реплики не сильно перегрузит оставшиеся, всего на 17% каждую).
+# Также предлагаю оставить запас +20-25% от данных при нагрузочном в maxReplicas, тем более и нод у нас 5.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-nginx
+  labels:
+    app: test-nginx
+spec:
+  selector:
+    matchLabels:
+      app: test-nginx
+  template:
+    metadata:
+      labels:
+        app: test-nginx
+    spec:
+      containers:
+      - name: test-nginx
+        image: nginx:1.21-alpine
+        imagePullPolicy: IfNotPresent
+        # Дадим возможность использовать больше процессорного времени по необходимости
+        # и немного подстрахуемся от троттлинга, тем более у нас может быть небольшой всплеск на старте
+        # По памяти возьмем небольшой запас, учитывающий небольшие флуктуации
+        resources:
+          limits:
+            memory: 160Mi
+            cpu: 500m
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        ports:
+        - containerPort: 80
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -c
+              - sleep 5
+        # имея 5-10 секунд для инициализации и "адекватное" приложение можно не использовать startupProbe
+        # учтем только начальную задержку 10 сек
+        # readinessProbe выведет под из работы при первом же сбое
+        # livenessProbe более лояльна, но если приложение так и не работает - убиваем
+        livenessProbe:
+          httpGet:
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            port: 80
+          failureThreshold: 1
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      # Распределим поды для отказоустойчивости
+      # 1) по зонам (3)
+      # 2) по нодам (5)
+      # это с одной стороны гарантирует, что все поды не окажутся на сбойной ноде/зоне
+      # с другой стороны возьмем "мягкое" правило, чтобы избежать проблем с оркестрацией при уменьшении количества рабочих
+      # зон и нод
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 10
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - test-nginx
+              topologyKey: "kubernetes.io/hostname"
+          - weight: 20
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - test-nginx
+              topologyKey: "csi.hetzner.cloud/location"
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: test-nginx
+  labels:
+    app: test-nginx
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: test-nginx
+  minReplicas: 3
+  maxReplicas: 5
+  metrics:
+    # Тк память неизменна, то берем только CPU
+    # А еще лучше бы добавить prometheus adapter и внешние метрики, но пока так
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  # По небходимости я бы настроил HPA подробнее, чтобы не допускать ненужных скачков по количеству реплик.
+  # Часто такое поведение не имеет смысла и создает лишнюю нагрузку на компоненты.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 180
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+# Сервис был нужен только для тестов
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-nginx
+spec:
+  selector:
+    app: test-nginx
+  ports:
+  - port: 80
+    targetPort: 80
